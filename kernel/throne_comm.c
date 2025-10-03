@@ -145,12 +145,12 @@ static ssize_t uid_scanner_write(struct file *file, const char __user *buffer,
 	return count;
 }
 
-static const struct proc_ops uid_scanner_proc_ops = {
-    .proc_open = uid_scanner_open,
-    .proc_read = seq_read,
-	.proc_write = uid_scanner_write,
-    .proc_lseek = seq_lseek,
-    .proc_release = single_release,
+static const struct file_operations uid_scanner_proc_ops = {
+    .open = uid_scanner_open,
+    .read = seq_read,
+    .write = uid_scanner_write,
+    .llseek = seq_lseek,
+    .release = single_release,
 };
 
 int ksu_throne_comm_init(void)
