@@ -76,6 +76,8 @@ bool getenforce()
 /*
  * get the subjective security ID of the current task
  */
+ 
+/*
 static inline u32 current_sid(void)
 {
 	const struct task_security_struct *tsec = current_security();
@@ -83,6 +85,7 @@ static inline u32 current_sid(void)
 	return tsec->sid;
 }
 #endif
+*/
 
 bool is_ksu_domain()
 {
