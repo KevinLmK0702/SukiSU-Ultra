@@ -7,6 +7,18 @@
 #include "../klog.h" // IWYU pragma: keep
 #include "ss/symtab.h"
 #include "../kernel_compat.h" // Add check Huawei Device
+// 添加缺失的结构体定义
+struct filename_trans_key {
+    u32 ttype;
+    u32 tclass;
+    const char *name;
+};
+
+struct filename_trans_datum {
+    struct ebitmap stypes;
+    u32 otype;
+    struct filename_trans_datum *next;
+};
 
 #define KSU_SUPPORT_ADD_TYPE
 
@@ -36,109 +48,94 @@ static bool add_xperm_rule(struct policydb *db, const char *s, const char *t,
 static bool add_type_rule(struct policydb *db, const char *s, const char *t,
 			  const char *c, const char *d, int effect);
 
+
 static bool add_filename_trans(struct policydb *db, const char *s,
 			       const char *t, const char *c, const char *d,
-			       const char *o);
-
-static bool add_genfscon(struct policydb *db, const char *fs_name,
-			 const char *path, const char *context);
-
-static bool add_type(struct policydb *db, const char *type_name, bool attr);
-
-static bool set_type_state(struct policydb *db, const char *type_name,
-			   bool permissive);
-
-static void add_typeattribute_raw(struct policydb *db, struct type_datum *type,
-				  struct type_datum *attr);
-
-static bool add_typeattribute(struct policydb *db, const char *type,
-			      const char *attr);
-
-//////////////////////////////////////////////////////
-// Implementation
-//////////////////////////////////////////////////////
-
-// Invert is adding rules for auditdeny; in other cases, invert is removing
-// rules
-#define strip_av(effect, invert) ((effect == AVTAB_AUDITDENY) == !invert)
-
-#define ksu_hash_for_each(node_ptr, n_slot, cur)                               \
-	int i;                                                                 \
-	for (i = 0; i < n_slot; ++i)                                           \
-		for (cur = node_ptr[i]; cur; cur = cur->next)
-
-// htable is a struct instead of pointer above 5.8.0:
-// https://elixir.bootlin.com/linux/v5.8-rc1/source/security/selinux/ss/symtab.h
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
-#define ksu_hashtab_for_each(htab, cur)                                        \
-	ksu_hash_for_each(htab.htable, htab.size, cur)
-#else
-#define ksu_hashtab_for_each(htab, cur)                                        \
-	ksu_hash_for_each(htab->htable, htab->size, cur)
-#endif
-
-// symtab_search is introduced on 5.9.0:
-// https://elixir.bootlin.com/linux/v5.9-rc1/source/security/selinux/ss/symtab.h
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0)
-#define symtab_search(s, name) hashtab_search((s)->table, name)
-#define symtab_insert(s, name, datum) hashtab_insert((s)->table, name, datum)
-#endif
-
-#define avtab_for_each(avtab, cur)                                             \
-	ksu_hash_for_each(avtab.htable, avtab.nslot, cur);
-
-static struct avtab_node *get_avtab_node(struct policydb *db,
-					 struct avtab_key *key,
-					 struct avtab_extended_perms *xperms)
+			       const char *o)
 {
-	struct avtab_node *node;
+	struct type_datum *src, *tgt, *def;
+	struct class_datum *cls;
 
-	/* AVTAB_XPERMS entries are not necessarily unique */
-	if (key->specified & AVTAB_XPERMS) {
-		bool match = false;
-		node = avtab_search_node(&db->te_avtab, key);
-		while (node) {
-			if ((node->datum.u.xperms->specified ==
-			     xperms->specified) &&
-			    (node->datum.u.xperms->driver == xperms->driver)) {
-				match = true;
-				break;
-			}
-			node = avtab_search_node_next(node, key->specified);
-		}
-		if (!match)
-			node = NULL;
-	} else {
-		node = avtab_search_node(&db->te_avtab, key);
+	src = symtab_search(&db->p_types, s);
+	if (src == NULL) {
+		pr_warn("source type %s does not exist\n", s);
+		return false;
+	}
+	tgt = symtab_search(&db->p_types, t);
+	if (tgt == NULL) {
+		pr_warn("target type %s does not exist\n", t);
+		return false;
+	}
+	cls = symtab_search(&db->p_classes, c);
+	if (cls == NULL) {
+		pr_warn("class %s does not exist\n", c);
+		return false;
+	}
+	def = symtab_search(&db->p_types, d);
+	if (def == NULL) {
+		pr_warn("default type %s does not exist\n", d);
+		return false;
 	}
 
-	if (!node) {
-		struct avtab_datum avdatum = {};
-		/*
-     * AUDITDENY, aka DONTAUDIT, are &= assigned, versus |= for
-     * others. Initialize the data accordingly.
-     */
-		if (key->specified & AVTAB_XPERMS) {
-			avdatum.u.xperms = xperms;
-		} else {
-			avdatum.u.data =
-				key->specified == AVTAB_AUDITDENY ? ~0U : 0U;
-		}
-		/* this is used to get the node - insertion is actually unique */
-		node = avtab_insert_nonunique(&db->te_avtab, key, &avdatum);
+	struct filename_trans_key key;
+	key.ttype = tgt->value;
+	key.tclass = cls->value;
+	key.name = (char *)o;
 
-		int grow_size = sizeof(struct avtab_key);
-		grow_size += sizeof(struct avtab_datum);
-		if (key->specified & AVTAB_XPERMS) {
-			grow_size += sizeof(u8);
-			grow_size += sizeof(u8);
-			grow_size += sizeof(u32) *
-				     ARRAY_SIZE(avdatum.u.xperms->perms.p);
+	struct filename_trans_datum *last = NULL;
+
+	// 使用 hashtab_search 替代 policydb_filenametr_search
+	struct filename_trans_datum *trans = hashtab_search(db->filename_trans, &key);
+	while (trans) {
+		if (ebitmap_get_bit(&trans->stypes, src->value - 1)) {
+			// Duplicate, overwrite existing data and return
+			trans->otype = def->value;
+			return true;
 		}
-		db->len += grow_size;
+		if (trans->otype == def->value)
+			break;
+		last = trans;
+		trans = trans->next;
 	}
 
-	return node;
+	if (trans == NULL) {
+		trans = (struct filename_trans_datum *)kcalloc(sizeof(*trans), 1, GFP_ATOMIC);
+		if (!trans) {
+			pr_err("alloc filename_trans_datum failed\n");
+			return false;
+		}
+		
+		struct filename_trans_key *new_key = (struct filename_trans_key *)kmalloc(sizeof(*new_key), GFP_ATOMIC);
+		if (!new_key) {
+			kfree(trans);
+			pr_err("alloc filename_trans_key failed\n");
+			return false;
+		}
+		
+		*new_key = key;
+		new_key->name = kstrdup(key.name, GFP_ATOMIC);
+		if (!new_key->name) {
+			kfree(trans);
+			kfree(new_key);
+			pr_err("alloc name failed\n");
+			return false;
+		}
+		
+		trans->next = last;
+		trans->otype = def->value;
+		
+		// 初始化 ebitmap
+		ebitmap_init(&trans->stypes);
+		
+		// 使用正确的插入函数
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
+		hashtab_insert(&db->filename_trans, new_key, trans, filenametr_key_params);
+#else
+		hashtab_insert(db->filename_trans, new_key, trans);
+#endif
+	}
+
+	return ebitmap_set_bit(&trans->stypes, src->value - 1, 1) == 0;
 }
 
 static bool add_rule(struct policydb *db, const char *s, const char *t,
@@ -559,7 +556,7 @@ static bool add_filename_trans(struct policydb *db, const char *s,
 			       filenametr_key_params);
 	}
 
-	db->compat_filename_trans_count++;
+	// db->compat_filename_trans_count++;
 	return ebitmap_set_bit(&trans->stypes, src->value - 1, 1) == 0;
 }
 
@@ -628,8 +625,8 @@ static bool add_type(struct policydb *db, const char *type_name, bool attr)
 
 	struct type_datum **new_type_val_to_struct =
 		ksu_realloc(db->type_val_to_struct,
-			    sizeof(*db->type_val_to_struct) * value,
-			    sizeof(*db->type_val_to_struct) * (value - 1));
+			    sizeof(struct type_datum *) * value,
+			    sizeof(struct type_datum *) * (value - 1));
 
 	if (!new_type_val_to_struct) {
 		pr_err("add_type: alloc type_val_to_struct failed\n");
